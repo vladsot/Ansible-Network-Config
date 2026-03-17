@@ -9,8 +9,16 @@
     backup_dir: "/tmp/net_backup_{{ ansible_date_time.epoch }}"
     rollback_script: "/tmp/net_rollback.sh"
     apply_delay: 15
+    log_file: "/var/log/network_config_{{ ansible_date_time.epoch }}.log"
 
   tasks:
+
+    - name: Show log file location
+      debug:
+        msg: "Logging to {{ log_file }}"
+
+    - name: Start log
+      shell: "echo '=== START $(date) ===' >> {{ log_file }}"
 
     # =========================
     # OS DETECTION
@@ -19,6 +27,31 @@
       set_fact:
         is_debian: "{{ ansible_facts.os_family == 'Debian' }}"
         is_redhat: "{{ ansible_facts.os_family == 'RedHat' }}"
+
+    # =========================
+    # INSTALL REQUIRED PACKAGES
+    # =========================
+    - name: Install required packages (Debian)
+      when: is_debian
+      apt:
+        name:
+          - rsync
+          - iputils-arping
+          - vim
+        state: present
+        update_cache: yes
+
+    - name: Install required packages (RHEL)
+      when: is_redhat
+      yum:
+        name:
+          - rsync
+          - arping
+          - vim
+        state: present
+
+    - name: Log package installation
+      shell: "echo 'Packages ensured: rsync, arping, vim' >> {{ log_file }}"
 
     # =========================
     # VALIDATION
@@ -38,28 +71,23 @@
       loop: "{{ dns_servers }}"
 
     # =========================
-    # BACKUP (MULTI-FILE SAFE)
+    # BACKUP
     # =========================
     - name: Create backup directory
       file:
         path: "{{ backup_dir }}"
         state: directory
 
-    - name: Backup netplan directory
+    - name: Log backup start
+      shell: "echo 'Backing up network config to {{ backup_dir }}' >> {{ log_file }}"
+
+    - name: Backup netplan
       when: is_debian
-      synchronize:
-        src: /etc/netplan/
-        dest: "{{ backup_dir }}/netplan/"
-        recursive: yes
-      delegate_to: localhost
+      shell: "rsync -a /etc/netplan/ {{ backup_dir }}/netplan/ 2>>{{ log_file }} || true"
 
     - name: Backup RHEL configs
       when: is_redhat
-      synchronize:
-        src: /etc/sysconfig/network-scripts/
-        dest: "{{ backup_dir }}/network-scripts/"
-        recursive: yes
-      delegate_to: localhost
+      shell: "rsync -a /etc/sysconfig/network-scripts/ {{ backup_dir }}/network-scripts/ 2>>{{ log_file }} || true"
 
     # =========================
     # ROLLBACK SCRIPT
@@ -70,25 +98,25 @@
         mode: '0755'
         content: |
           #!/bin/bash
-          echo "ROLLBACK TRIGGERED"
+          echo "ROLLBACK TRIGGERED $(date)" >> {{ log_file }}
 
           if [ -d "{{ backup_dir }}/netplan" ]; then
             rm -rf /etc/netplan/*
-            cp -r {{ backup_dir }}/netplan/* /etc/netplan/
-            netplan apply
+            rsync -a {{ backup_dir }}/netplan/ /etc/netplan/
+            netplan apply >> {{ log_file }} 2>&1
           fi
 
           if [ -d "{{ backup_dir }}/network-scripts" ]; then
             rm -rf /etc/sysconfig/network-scripts/*
-            cp -r {{ backup_dir }}/network-scripts/* /etc/sysconfig/network-scripts/
-            systemctl restart network || systemctl restart NetworkManager
+            rsync -a {{ backup_dir }}/network-scripts/ /etc/sysconfig/network-scripts/
+            systemctl restart network >> {{ log_file }} 2>&1 || systemctl restart NetworkManager >> {{ log_file }} 2>&1
           fi
 
     # =========================
     # SCHEDULE ROLLBACK
     # =========================
     - name: Schedule rollback in 2 minutes
-      shell: "nohup bash -c 'sleep 120 && {{ rollback_script }}' >/dev/null 2>&1 &"
+      shell: "nohup bash -c 'sleep 120 && {{ rollback_script }}' >> {{ log_file }} 2>&1 &"
 
     # =========================
     # WARNING DELAY
@@ -103,6 +131,9 @@
     # =========================
     # APPLY (DEBIAN)
     # =========================
+    - name: Log apply start
+      shell: "echo 'Applying network config on {{ interface }}' >> {{ log_file }}"
+
     - name: Apply netplan config
       when: is_debian
       copy:
@@ -124,7 +155,7 @@
 
     - name: Apply netplan
       when: is_debian
-      command: netplan apply
+      shell: "netplan apply >> {{ log_file }} 2>&1"
 
     # =========================
     # APPLY (RHEL)
@@ -145,7 +176,7 @@
 
     - name: Restart network
       when: is_redhat
-      command: systemctl restart network || systemctl restart NetworkManager
+      shell: "systemctl restart network >> {{ log_file }} 2>&1 || systemctl restart NetworkManager >> {{ log_file }} 2>&1"
 
     # =========================
     # CONNECTIVITY CHECK (ARP)
@@ -155,37 +186,25 @@
         port: 22
         timeout: 60
 
-    - name: Check if arping is available
-      command: which arping
-      register: arping_check
-      ignore_errors: yes
-      changed_when: false
-
-    - name: Fail if arping is not installed
-      fail:
-        msg: "arping is required for gateway validation but not installed."
-      when: arping_check.rc != 0
-
     - name: ARP check to gateway
-      shell: "arping -c 3 -I {{ interface }} {{ gateway }}"
+      shell: "arping -c 3 -I {{ interface }} {{ gateway }} >> {{ log_file }} 2>&1"
       register: arp_result
       retries: 3
       delay: 3
       until: arp_result.rc == 0
 
     # =========================
-    # CANCEL ROLLBACK ONLY IF SAFE
+    # CANCEL ROLLBACK
     # =========================
     - name: Cancel rollback
-      shell: "pkill -f '{{ rollback_script }}' || true"
+      shell: "pkill -f '{{ rollback_script }}' >> {{ log_file }} 2>&1 || true"
       when: arp_result.rc == 0
 
-    - name: Fail if gateway unreachable (rollback will execute)
+    - name: Log success
+      shell: "echo 'SUCCESS $(date)' >> {{ log_file }}"
+      when: arp_result.rc == 0
+
+    - name: Fail if unreachable
       fail:
-        msg: "Gateway not reachable via ARP. Rollback will proceed."
+        msg: "Gateway unreachable. Rollback will execute."
       when: arp_result.rc != 0
-
-    - name: Success message
-      debug:
-        msg: "Network configured and verified (ARP OK). Rollback canceled."
-      when: arp_result.rc == 0
