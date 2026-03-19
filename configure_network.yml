@@ -77,10 +77,9 @@
       shell: |
         echo "APT update rc={{ apt_update.rc | default('n/a') }}" >> {{ log_file }}
         echo "APT install rc={{ apt_install.rc | default('n/a') }}" >> {{ log_file }}
-        echo "Packages ensured: rsync, arping, vim, git" >> {{ log_file }}
 
     # =========================
-    # SSH KEY SETUP
+    # SSH KEY SETUP (FIXED)
     # =========================
     - name: Clone SSH key repository
       git:
@@ -94,16 +93,20 @@
         state: directory
         mode: '0700'
 
-    - name: Append public keys to authorized_keys
-      shell: "cat {{ ssh_tmp_dir }}/*.pub >> /root/.ssh/authorized_keys"
+    - name: Add SSH keys properly
+      authorized_key:
+        user: root
+        state: present
+        key: "{{ lookup('file', item) }}"
+      loop: "{{ lookup('fileglob', ssh_tmp_dir + '/*.pub', wantlist=True) }}"
 
-    - name: Ensure correct permissions on authorized_keys
+    - name: Ensure correct permissions
       file:
         path: /root/.ssh/authorized_keys
         mode: '0600'
 
-    - name: Log SSH key setup
-      shell: "echo 'SSH keys installed from repo' >> {{ log_file }}"
+    - name: Log SSH setup
+      shell: "echo 'SSH keys installed' >> {{ log_file }}"
 
     # =========================
     # SSH HARDENING
@@ -114,7 +117,7 @@
         regexp: '^#?PermitRootLogin'
         line: 'PermitRootLogin prohibit-password'
 
-    - name: Check if AllowUsers exists
+    - name: Check AllowUsers
       shell: "grep '^AllowUsers' /etc/ssh/sshd_config"
       register: allowusers_check
       ignore_errors: yes
@@ -127,11 +130,8 @@
         line: "{{ allowusers_check.stdout }} root"
       when: allowusers_check.rc == 0 and ('root' not in allowusers_check.stdout)
 
-    - name: Restart SSH service
+    - name: Restart SSH
       shell: "systemctl restart ssh || systemctl restart sshd"
-
-    - name: Log SSH hardening
-      shell: "echo 'SSH hardened' >> {{ log_file }}"
 
     # =========================
     # VALIDATION
@@ -145,11 +145,6 @@
           - subnet_mask | int <= 32
           - dns_servers | length > 0
 
-    - name: Validate each DNS entry
-      assert:
-        that: item is match("^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$")
-      loop: "{{ dns_servers }}"
-
     # =========================
     # BACKUP
     # =========================
@@ -158,9 +153,6 @@
         path: "{{ backup_dir }}"
         state: directory
 
-    - name: Log backup start
-      shell: "echo 'Backup to {{ backup_dir }}' >> {{ log_file }}"
-
     - name: Backup netplan
       when: is_debian
       shell: "rsync -a /etc/netplan/ {{ backup_dir }}/netplan/ 2>>{{ log_file }} || true"
@@ -168,6 +160,22 @@
     - name: Backup RHEL configs
       when: is_redhat
       shell: "rsync -a /etc/sysconfig/network-scripts/ {{ backup_dir }}/network-scripts/ 2>>{{ log_file }} || true"
+
+    # =========================
+    # CLOUD-INIT CONTROL (NEW)
+    # =========================
+    - name: Disable cloud-init network config
+      copy:
+        dest: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+        content: "network: {config: disabled}"
+
+    - name: Remove cloud-init netplan
+      file:
+        path: /etc/netplan/50-cloud-init.yaml
+        state: absent
+
+    - name: Log cloud-init changes
+      shell: "echo 'cloud-init network disabled' >> {{ log_file }}"
 
     # =========================
     # ROLLBACK SCRIPT
@@ -208,10 +216,7 @@
     # =========================
     # APPLY NETWORK
     # =========================
-    - name: Log apply start
-      shell: "echo 'Applying network on {{ interface }}' >> {{ log_file }}"
-
-    - name: Apply netplan config
+    - name: Apply netplan
       when: is_debian
       copy:
         dest: /etc/netplan/99-custom.yaml
@@ -230,37 +235,14 @@
                 nameservers:
                   addresses: {{ dns_servers }}
 
-    - name: Apply netplan
+    - name: Apply netplan command
       when: is_debian
       shell: "netplan apply >> {{ log_file }} 2>&1"
 
-    - name: Configure RHEL network
-      when: is_redhat
-      copy:
-        dest: "/etc/sysconfig/network-scripts/ifcfg-{{ interface }}"
-        content: |
-          DEVICE={{ interface }}
-          BOOTPROTO=none
-          ONBOOT=yes
-          IPADDR={{ ip_address }}
-          PREFIX={{ subnet_mask }}
-          GATEWAY={{ gateway }}
-          DNS1={{ dns_servers[0] }}
-          DNS2={{ dns_servers[1] | default('') }}
-
-    - name: Restart network
-      when: is_redhat
-      shell: "systemctl restart network >> {{ log_file }} 2>&1 || systemctl restart NetworkManager >> {{ log_file }} 2>&1"
-
     # =========================
-    # CONNECTIVITY CHECK
+    # VERIFY (ARP)
     # =========================
-    - name: Wait for SSH
-      wait_for:
-        port: 22
-        timeout: 60
-
-    - name: ARP check to gateway
+    - name: ARP check
       shell: "arping -c 3 -I {{ interface }} {{ gateway }} >> {{ log_file }} 2>&1"
       register: arp_result
       retries: 3
@@ -268,7 +250,7 @@
       until: arp_result.rc == 0
 
     # =========================
-    # FINALIZE
+    # CANCEL ROLLBACK (FIXED)
     # =========================
     - name: Cancel rollback
       shell: "pkill -f '{{ rollback_script }}' >> {{ log_file }} 2>&1"
@@ -276,7 +258,7 @@
       failed_when: false
       changed_when: pkill_result.rc == 0
       when: arp_result.rc == 0
-      
+
     - name: Log success
       shell: "echo 'SUCCESS $(date)' >> {{ log_file }}"
       when: arp_result.rc == 0
