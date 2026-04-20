@@ -1,5 +1,5 @@
 ---
-- name: Configure network safely (idempotent)
+- name: Configure network safely
   hosts: localhost
   become: yes
   connection: local
@@ -16,7 +16,7 @@
 
   tasks:
 
-    - name: Show log file location
+    - name: Show log file
       debug:
         msg: "Logging to {{ log_file }}"
 
@@ -26,29 +26,68 @@
     # =========================
     # OS DETECTION
     # =========================
-    - name: Detect OS family
+    - name: Detect OS
       set_fact:
         is_debian: "{{ ansible_facts.os_family == 'Debian' }}"
         is_redhat: "{{ ansible_facts.os_family == 'RedHat' }}"
 
     # =========================
-    # APT REPO CLEANUP (NEW)
+    # APT CLEANUP + DEDUP
     # =========================
-    - name: Find APT repo files
+    - name: Find APT files
       when: is_debian
       find:
         paths: /etc/apt
-        patterns: "*.list"
         recurse: yes
-      register: apt_list_files
+        patterns:
+          - "*.list"
+          - "*.sources"
+      register: apt_files
 
-    - name: Clean and deduplicate APT repo definitions
+    - name: Split list and sources
+      when: is_debian
+      set_fact:
+        apt_list_files: "{{ apt_files.files | selectattr('path','search','\\.list$') | list }}"
+        apt_sources_files: "{{ apt_files.files | selectattr('path','search','\\.sources$') | list }}"
+
+    - name: Extract URLs from .sources
+      when: is_debian
+      shell: "awk '/^URIs:/ {for(i=2;i<=NF;i++) print $i}' {{ item.path }}"
+      register: sources_urls
+      loop: "{{ apt_sources_files }}"
+      changed_when: false
+
+    - name: Build sources URL list
+      when: is_debian
+      set_fact:
+        sources_url_list: "{{ sources_urls.results | map(attribute='stdout_lines') | list | flatten }}"
+
+    - name: Disable duplicate .list repos
       when: is_debian
       shell: |
-        set -e
+        FILE="{{ item.path }}"
+        MATCH=0
+        while read -r line; do
+          if [[ "$line" =~ ^deb ]]; then
+            url=$(echo "$line" | awk '{print $2}')
+            for s in {{ sources_url_list | join(' ') }}; do
+              [[ "$url" == "$s" ]] && MATCH=1
+            done
+          fi
+        done < "$FILE"
+        if [ "$MATCH" -eq 1 ]; then
+          mv "$FILE" "$FILE.disabled"
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ apt_list_files }}"
+      failed_when: false
+
+    - name: Clean malformed/duplicate lines
+      when: is_debian
+      shell: |
         FILE="{{ item.path }}"
         TMP="$(mktemp)"
-
         awk '
           /^[[:space:]]*#/ { print; next }
           /^[[:space:]]*$/ { print; next }
@@ -68,20 +107,16 @@
           mv "$TMP" "$FILE"
         fi
 
-        rm -f "$TMP.clean" || true
+        rm -f "$TMP.clean"
       args:
         executable: /bin/bash
-      loop: "{{ apt_list_files.files }}"
-      register: repo_cleanup
-
-    - name: Log repo cleanup
-      when: is_debian
-      shell: "echo 'APT repo cleanup completed' >> {{ log_file }}"
+      loop: "{{ apt_list_files }}"
+      failed_when: false
 
     # =========================
-    # PACKAGE INSTALL (RESILIENT)
+    # PACKAGE INSTALL
     # =========================
-    - name: Fix apt issues
+    - name: Fix apt
       when: is_debian
       shell: |
         dpkg --configure -a || true
@@ -92,10 +127,8 @@
       when: is_debian
       apt:
         update_cache: yes
-      register: apt_update
       retries: 5
       delay: 5
-      until: apt_update is succeeded
 
     - name: Install packages (Debian)
       when: is_debian
@@ -118,7 +151,7 @@
         state: present
 
     # =========================
-    # SSH KEYS
+    # SSH SETUP
     # =========================
     - name: Clone SSH repo
       git:
@@ -126,28 +159,28 @@
         dest: "{{ ssh_tmp_dir }}"
         update: yes
 
-    - name: Ensure root .ssh exists
+    - name: Ensure .ssh
       file:
         path: /root/.ssh
         state: directory
         mode: '0700'
 
-    - name: Install SSH keys
+    - name: Install keys
       authorized_key:
         user: root
         state: present
         key: "{{ lookup('file', item) }}"
       loop: "{{ lookup('fileglob', ssh_tmp_dir + '/*.pub', wantlist=True) }}"
 
-    - name: Validate SSH keys exist
+    - name: Verify keys exist
       stat:
         path: /root/.ssh/authorized_keys
-      register: ssh_keys_file
+      register: ssh_keys
 
-    - name: Fail if no SSH keys
+    - name: Abort if no keys
       fail:
-        msg: "No SSH keys found. Aborting to avoid lockout."
-      when: ssh_keys_file.stat.size == 0
+        msg: "No SSH keys → aborting"
+      when: ssh_keys.stat.size == 0
 
     # =========================
     # SSH HARDENING
@@ -158,18 +191,18 @@
         regexp: '^#?PermitRootLogin'
         line: 'PermitRootLogin prohibit-password'
 
-    - name: Check AllowUsers
+    - name: Handle AllowUsers
       shell: "grep '^AllowUsers' /etc/ssh/sshd_config"
-      register: allowusers_check
+      register: allowusers
       ignore_errors: yes
       changed_when: false
 
-    - name: Add root to AllowUsers
+    - name: Append root to AllowUsers
       lineinfile:
         path: /etc/ssh/sshd_config
         regexp: '^AllowUsers'
-        line: "{{ allowusers_check.stdout }} root"
-      when: allowusers_check.rc == 0 and ('root' not in allowusers_check.stdout)
+        line: "{{ allowusers.stdout }} root"
+      when: allowusers.rc == 0 and ('root' not in allowusers.stdout)
 
     - name: Restart SSH
       service:
@@ -177,9 +210,9 @@
         state: restarted
 
     # =========================
-    # CLOUD-INIT CONTROL
+    # CLOUD-INIT
     # =========================
-    - name: Disable cloud-init networking
+    - name: Disable cloud-init network
       copy:
         dest: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
         content: "network: {config: disabled}"
@@ -190,15 +223,15 @@
         state: absent
 
     # =========================
-    # NETPLAN CONFIG
+    # BACKUP + NETPLAN
     # =========================
     - name: Ensure backup directory exists
       file:
         path: "{{ backup_dir }}/netplan"
         state: directory
-        mode: '0755'
-    - name: Backup netplan BEFORE change
-      shell: "rsync -a /etc/netplan/ {{ backup_dir }}/netplan/"
+
+    - name: Backup netplan
+      command: rsync -a /etc/netplan/ {{ backup_dir }}/netplan/
 
     - name: Write netplan config
       copy:
@@ -221,7 +254,7 @@
       register: netplan_result
 
     # =========================
-    # ROLLBACK CONTROL
+    # ROLLBACK
     # =========================
     - name: Kill previous rollback jobs
       shell: "pkill -f '{{ rollback_tag }}' || true"
@@ -259,5 +292,8 @@
 
     - name: Fail if unreachable
       fail:
-        msg: "Gateway unreachable. Rollback will execute."
+        msg: "Gateway unreachable → rollback will execute"
       when: netplan_result.changed and arp_result.rc != 0
+
+    - name: Log success
+      shell: "echo 'SUCCESS $(date)' >> {{ log_file }}"
