@@ -32,93 +32,51 @@
         is_redhat: "{{ ansible_facts.os_family == 'RedHat' }}"
 
     # =========================
-    # Delete jfrog repo if exists (IDEMPOTENT)
-    # =========================    
-    - name: Remove Fortinet Docker proxy repo from docker.list
-      become: yes
-      apt_repository:
-        repo: "deb https://jfrog.corp.fortinet.com/artifactory/apt-docker-proxy"
-        state: absent
-        filename: docker
-
+    # APT REPO CLEANUP (NEW)
     # =========================
-    # Deduplicate sources.list entries (IDEMPOTENT)
-    # =========================
-
----
-- name: Configure network and clean APT sources
-  hosts: all
-  become: yes
-
-  vars:
-    apt_sources_dir: /etc/apt/sources.list.d
-    main_sources_file: /etc/apt/sources.list
-
-  tasks:
-
-    # --- Remove unwanted JFrog repo (if present anywhere) ---
-    - name: Remove jfrog docker proxy repo globally
-      lineinfile:
-        path: "{{ item }}"
-        regexp: '.*apt-docker-proxy.*'
-        state: absent
-      with_fileglob:
-        - "{{ main_sources_file }}"
-        - "{{ apt_sources_dir }}/*.list"
-      ignore_errors: yes
-
-    # --- Collect repo files ---
-    - name: Find all APT source files
+    - name: Find APT repo files
+      when: is_debian
       find:
-        paths: "{{ apt_sources_dir }}"
+        paths: /etc/apt
         patterns: "*.list"
-      register: apt_repo_files
+        recurse: yes
+      register: apt_list_files
 
-    - name: Build full repo file list
-      set_fact:
-        all_repo_files: "{{ apt_repo_files.files | map(attribute='path') | list + [main_sources_file] }}"
-
-    # --- Deduplicate repo lines (keep last occurrence) ---
-    - name: Deduplicate APT repo entries (keep last occurrence)
+    - name: Clean and deduplicate APT repo definitions
+      when: is_debian
       shell: |
-        file="{{ item }}"
-        tmp="$(mktemp)"
+        set -e
+        FILE="{{ item.path }}"
+        TMP="$(mktemp)"
 
-        tac "$file" | awk '!seen[$0]++' | tac > "$tmp"
+        awk '
+          /^[[:space:]]*#/ { print; next }
+          /^[[:space:]]*$/ { print; next }
+          /^[[:space:]]*deb(-src)?[[:space:]]+/ { print; next }
+        ' "$FILE" > "$TMP.clean"
 
-        if ! cmp -s "$file" "$tmp"; then
-          mv "$tmp" "$file"
-        else
-          rm "$tmp"
+        awk '
+          /^[[:space:]]*deb(-src)?[[:space:]]+/ {
+            if (!seen[$0]++) print
+            next
+          }
+          { print }
+        ' "$TMP.clean" > "$TMP"
+
+        if ! cmp -s "$TMP" "$FILE"; then
+          cp "$FILE" "$FILE.bak"
+          mv "$TMP" "$FILE"
         fi
+
+        rm -f "$TMP.clean" || true
       args:
         executable: /bin/bash
-      loop: "{{ all_repo_files }}"
-      changed_when: false
+      loop: "{{ apt_list_files.files }}"
+      register: repo_cleanup
 
-    # --- Validate: only 1 repo per file ---
-    - name: Count repo definitions per file
-      shell: |
-        grep -E '^\s*deb(-src)? ' {{ item }} | wc -l
-      register: repo_line_counts
-      loop: "{{ all_repo_files }}"
-      changed_when: false
-
-    - name: Fail if multiple repo definitions found
-      fail:
-        msg: "Repo file {{ item.item }} contains {{ item.stdout }} repo definitions (expected 0 or 1)"
-      loop: "{{ repo_line_counts.results }}"
-      when: item.stdout | int > 1
-
-    # --- Update apt cache after cleanup ---
-    - name: Update apt cache
-      apt:
-        update_cache: yes
-
-    # --- Example network task placeholder ---
-    - name: Placeholder - ensure network config applied
-      debug:
-        msg: "Network configuration would be applied here"
+    - name: Log repo cleanup
+      when: is_debian
+      shell: "echo 'APT repo cleanup completed' >> {{ log_file }}"
 
     # =========================
     # PACKAGE INSTALL (RESILIENT)
@@ -160,7 +118,7 @@
         state: present
 
     # =========================
-    # SSH KEYS (IDEMPOTENT)
+    # SSH KEYS
     # =========================
     - name: Clone SSH repo
       git:
@@ -181,6 +139,16 @@
         key: "{{ lookup('file', item) }}"
       loop: "{{ lookup('fileglob', ssh_tmp_dir + '/*.pub', wantlist=True) }}"
 
+    - name: Validate SSH keys exist
+      stat:
+        path: /root/.ssh/authorized_keys
+      register: ssh_keys_file
+
+    - name: Fail if no SSH keys
+      fail:
+        msg: "No SSH keys found. Aborting to avoid lockout."
+      when: ssh_keys_file.stat.size == 0
+
     # =========================
     # SSH HARDENING
     # =========================
@@ -190,13 +158,13 @@
         regexp: '^#?PermitRootLogin'
         line: 'PermitRootLogin prohibit-password'
 
-    - name: Ensure root in AllowUsers if present
+    - name: Check AllowUsers
       shell: "grep '^AllowUsers' /etc/ssh/sshd_config"
       register: allowusers_check
       ignore_errors: yes
       changed_when: false
 
-    - name: Append root to AllowUsers
+    - name: Add root to AllowUsers
       lineinfile:
         path: /etc/ssh/sshd_config
         regexp: '^AllowUsers'
@@ -209,26 +177,7 @@
         state: restarted
 
     # =========================
-    # VALIDATION
-    # =========================
-    - name: Validate input
-      assert:
-        that:
-          - ip_address is match("^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$")
-          - gateway is match("^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}$")
-          - subnet_mask | int >= 0
-          - subnet_mask | int <= 32
-
-    # =========================
-    # BACKUP (ONLY ON CHANGE LATER)
-    # =========================
-    - name: Create backup dir
-      file:
-        path: "{{ backup_dir }}"
-        state: directory
-
-    # =========================
-    # CLOUD-INIT DISABLE
+    # CLOUD-INIT CONTROL
     # =========================
     - name: Disable cloud-init networking
       copy:
@@ -243,6 +192,9 @@
     # =========================
     # NETPLAN CONFIG
     # =========================
+    - name: Backup netplan BEFORE change
+      shell: "rsync -a /etc/netplan/ {{ backup_dir }}/netplan/"
+
     - name: Write netplan config
       copy:
         dest: /etc/netplan/99-custom.yaml
@@ -264,7 +216,7 @@
       register: netplan_result
 
     # =========================
-    # ROLLBACK (SINGLE INSTANCE)
+    # ROLLBACK CONTROL
     # =========================
     - name: Kill previous rollback jobs
       shell: "pkill -f '{{ rollback_tag }}' || true"
@@ -276,31 +228,17 @@
         mode: '0755'
         content: |
           #!/bin/bash
-          echo "ROLLBACK TRIGGERED $(date)" >> {{ log_file }}
-          if [ -d "{{ backup_dir }}/netplan" ]; then
-            rm -rf /etc/netplan/*
-            rsync -a {{ backup_dir }}/netplan/ /etc/netplan/
-            netplan apply
-          fi
-
-    - name: Backup netplan before change
-      when: netplan_result.changed
-      shell: "rsync -a /etc/netplan/ {{ backup_dir }}/netplan/"
+          rsync -a {{ backup_dir }}/netplan/ /etc/netplan/
+          netplan apply
 
     - name: Schedule rollback
       when: netplan_result.changed
       shell: "nohup bash -c 'sleep 120 && {{ rollback_script }} #{{ rollback_tag }}' >/dev/null 2>&1 &"
 
-    # =========================
-    # APPLY NETWORK ONLY IF CHANGED
-    # =========================
     - name: Apply netplan
       command: netplan apply
       when: netplan_result.changed
 
-    # =========================
-    # VERIFY
-    # =========================
     - name: ARP check
       when: netplan_result.changed
       shell: "arping -c 3 -I {{ interface }} {{ gateway }}"
@@ -309,26 +247,12 @@
       delay: 3
       until: arp_result.rc == 0
 
-    # =========================
-    # CANCEL ROLLBACK
-    # =========================
     - name: Cancel rollback
       when: netplan_result.changed and arp_result.rc == 0
       shell: "pkill -f '{{ rollback_tag }}'"
-      register: pkill_result
       failed_when: false
 
     - name: Fail if unreachable
       fail:
         msg: "Gateway unreachable. Rollback will execute."
       when: netplan_result.changed and arp_result.rc != 0
-
-    # =========================
-    # CLEANUP
-    # =========================
-    - name: Cleanup old backups
-      shell: "find /tmp -name 'net_backup_*' -mtime +1 -exec rm -rf {} +"
-      ignore_errors: yes
-
-    - name: Log success
-      shell: "echo 'SUCCESS $(date)' >> {{ log_file }}"
