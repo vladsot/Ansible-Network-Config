@@ -142,7 +142,7 @@
 
     - name: Install packages (RHEL)
       when: is_redhat
-      yum:
+      dnf:
         name:
           - rsync
           - arping
@@ -216,24 +216,40 @@
       copy:
         dest: /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
         content: "network: {config: disabled}"
+      failed_when: false
 
     - name: Remove cloud-init netplan
+      when: is_debian
       file:
         path: /etc/netplan/50-cloud-init.yaml
         state: absent
 
     # =========================
-    # BACKUP + NETPLAN
+    # BACKUP + NETWORK CONFIG
     # =========================
-    - name: Ensure backup directory exists
+    - name: Ensure backup directory (Debian)
+      when: is_debian
       file:
         path: "{{ backup_dir }}/netplan"
         state: directory
 
+    - name: Ensure backup directory (RHEL)
+      when: is_redhat
+      file:
+        path: "{{ backup_dir }}/nm-connections"
+        state: directory
+
     - name: Backup netplan
+      when: is_debian
       command: rsync -a /etc/netplan/ {{ backup_dir }}/netplan/
 
+    - name: Backup NM connections (RHEL)
+      when: is_redhat
+      shell: rsync -a /etc/NetworkManager/system-connections/ {{ backup_dir }}/nm-connections/
+      failed_when: false
+
     - name: Write netplan config
+      when: is_debian
       copy:
         dest: /etc/netplan/99-custom.yaml
         backup: yes
@@ -253,6 +269,39 @@
                   addresses: {{ dns_servers }}
       register: netplan_result
 
+    - name: Configure network via NetworkManager (RHEL)
+      when: is_redhat
+      shell: |
+        CON=$(nmcli -g GENERAL.CONNECTION device show {{ interface }} 2>/dev/null | head -1)
+        if [ -z "$CON" ] || [ "$CON" = "--" ]; then
+          nmcli connection add type ethernet ifname {{ interface }} con-name {{ interface }} \
+            ipv4.method manual \
+            ipv4.addresses {{ ip_address }}/{{ subnet_mask }} \
+            ipv4.gateway {{ gateway }} \
+            ipv4.dns "{{ dns_servers | join(' ') }}" \
+            connection.autoconnect yes
+        else
+          nmcli connection modify "$CON" \
+            ipv4.method manual \
+            ipv4.addresses {{ ip_address }}/{{ subnet_mask }} \
+            ipv4.gateway {{ gateway }} \
+            ipv4.dns "{{ dns_servers | join(' ') }}" \
+            connection.autoconnect yes
+        fi
+      args:
+        executable: /bin/bash
+      register: nm_result
+
+    - name: Set network_changed (Debian)
+      when: is_debian
+      set_fact:
+        network_changed: "{{ netplan_result.changed }}"
+
+    - name: Set network_changed (RHEL)
+      when: is_redhat
+      set_fact:
+        network_changed: "{{ nm_result.rc == 0 }}"
+
     # =========================
     # ROLLBACK
     # =========================
@@ -260,7 +309,8 @@
       shell: "pkill -f '{{ rollback_tag }}' || true"
       failed_when: false
 
-    - name: Create rollback script
+    - name: Create rollback script (Debian)
+      when: is_debian
       copy:
         dest: "{{ rollback_script }}"
         mode: '0755'
@@ -269,16 +319,35 @@
           rsync -a {{ backup_dir }}/netplan/ /etc/netplan/
           netplan apply
 
+    - name: Create rollback script (RHEL)
+      when: is_redhat
+      copy:
+        dest: "{{ rollback_script }}"
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          rsync -a {{ backup_dir }}/nm-connections/ /etc/NetworkManager/system-connections/
+          nmcli connection reload
+          nmcli connection up {{ interface }}
+
     - name: Schedule rollback
-      when: netplan_result.changed
+      when: network_changed
       shell: "nohup bash -c 'sleep 120 && {{ rollback_script }} #{{ rollback_tag }}' >/dev/null 2>&1 &"
 
     - name: Apply netplan
+      when: is_debian and network_changed
       command: netplan apply
-      when: netplan_result.changed
+
+    - name: Apply network config (RHEL)
+      when: is_redhat and network_changed
+      shell: |
+        nmcli connection reload
+        nmcli connection up {{ interface }}
+      args:
+        executable: /bin/bash
 
     - name: ARP check
-      when: netplan_result.changed
+      when: network_changed
       shell: "arping -c 3 -I {{ interface }} {{ gateway }}"
       register: arp_result
       retries: 3
@@ -286,14 +355,14 @@
       until: arp_result.rc == 0
 
     - name: Cancel rollback
-      when: netplan_result.changed and arp_result.rc == 0
+      when: network_changed and arp_result.rc == 0
       shell: "pkill -f '{{ rollback_tag }}'"
       failed_when: false
 
     - name: Fail if unreachable
       fail:
         msg: "Gateway unreachable → rollback will execute"
-      when: netplan_result.changed and arp_result.rc != 0
+      when: network_changed and arp_result.rc != 0
 
     - name: Log success
       shell: "echo 'SUCCESS $(date)' >> {{ log_file }}"
