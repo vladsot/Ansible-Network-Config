@@ -194,7 +194,7 @@
     - name: Handle AllowUsers
       shell: "grep '^AllowUsers' /etc/ssh/sshd_config"
       register: allowusers
-      ignore_errors: yes
+      failed_when: false
       changed_when: false
 
     - name: Append root to AllowUsers
