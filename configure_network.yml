@@ -145,7 +145,7 @@
       dnf:
         name:
           - rsync
-          - arping
+          - iputils
           - vim
           - git
         state: present
